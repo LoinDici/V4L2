@@ -1,0 +1,860 @@
+The Video4Linux2 API: an introduction
+[Posted October 11, 2006 by corbet]
+
+Your editor has recently had the opportunity to write a Linux driver for a camera device - the camera which will be packaged with the One Laptop Per Child system, in particular. This driver works with the internal kernel API designed for such purposes: the Video4Linux2 API. In the process of writing this code, your editor made the shocking discovery that, in fact, this API is not particularly well documented - though the user-space side is, instead, quite well documented indeed. In an attempt to remedy the situation somewhat, LWN will, over the coming months, publish a series of articles describing how to write drivers for the V4L2 interface.
+V4L2 has a long history - the first gleam came into Bill Dirks's eye back around August of 1998. Development proceeded for years, and the V4L2 API was finally merged into the mainline in November, 2002, when 2.5.46 was released. To this day, however, quite a few Linux drivers do not support the newer API; the conversion process is an ongoing task. Meanwhile, the V4L2 API continues to evolve, with some major changes being made in 2.6.18. Applications which work with V4L2 remain relatively scarce.
+
+V4L2 is designed to support a wide variety of devices, only some of which are truly "video" in nature:
+
+The video capture interface grabs video data from a tuner or camera device. For many, video capture will be the primary application for V4L2. Since your editor's experience is strongest in this area, this series will tend to emphasize the capture API, but there is more to V4L2 than that.
+The video output interface allows applications to drive peripherals which can provide video images - perhaps in the form of a television signal - outside of the computer.
+A variant of the capture interface can be found in the video overlay interface, whose job is to facilitate the direct display of video data from a capture device. Video data moves directly from the capture device to the display, without passing through the system's CPU.
+The VBI interfaces provide access to data transmitted during the video blanking interval. There are two of them, the "raw" and "sliced" interfaces, which differ in the amount of processing of the VBI data performed in hardware.
+The radio interface provides access to audio streams from AM and FM tuner devices.
+Other types of devices are possible. The V4L2 API has some stubs for "codec" and "effect" devices, both of which perform transformations on video data streams. Those areas have not yet been completely specified, however, much less implemented. There are also the "teletext" and "radio data system" interfaces currently implemented in the older V4L1 API; those have not been moved to V4L2 and there do not appear to be any immediate plans to do so.
+
+Video devices differ from many others in the vast number of ways in which they can be configured. As a result, much of a V4L2 driver implements code which enables applications to discover a given device's capabilities and to configure that device to operate in the desired manner. The V4L2 API defines several dozen callbacks for the configuration of parameters like tuner frequencies, windowing and cropping, frame rates, video compression, image parameters (brightness, contrast, ...), video standards, video formats, etc. Much of this series will be devoted to looking at how this configuration process happens.
+
+Then, there is the small task of actually performing I/O at video rates in an efficient manner. The V4L2 API defines three different ways of moving video data between user space and the peripheral, some of which can be on the complex side. Separate articles will look at video I/O and the video-buf layer which has been provided to handle common tasks.
+
+Subsequent articles will appear every few weeks, and will be added to the list below:
+
+Part 2: registration and open()
+Part 3: Basic ioctl() handling
+Part 4: Inputs and Outputs
+Part 5a: Colors and formats
+Part 5b: Format negotiation
+Part 6a: Basic frame I/O
+Part 6b: Streaming I/O
+Part 7: Controls
+
+Video4Linux2 part 2: registration and open()
+[Posted October 18, 2006 by corbet]
+
+This is the second article in the LWN series on writing drivers for the Video4Linux2 kernel interface; those who have not yet seen the introductory article may wish to start there. This installment will look at the overall structure of a Video4Linux driver and the device registration process.
+Before starting, it is worth noting that there are two resources which will prove invaluable for anybody working with video drivers:
+
+The V4L2 API Specification. This document covers the API from the user-space point of view, but, to a great extent, V4L2 drivers implement that API directly. So most of the structures are the same, and the semantics of the V4L2 calls are clearly laid out. Print a copy (consider cutting out the Free Documentation License text to save trees) and keep it somewhere within easy reach.
+The "vivi" driver found in the kernel source as drivers/media/video/vivi.c. It is a virtual driver, in that it generates test patterns and does not actually interface to any hardware. As such, it serves as a relatively clear illustration of how V4L2 drivers should be written.
+To start, every V4L2 driver must include the requisite header file:
+
+    #include <linux/videodev2.h>
+Much of the needed information is there. When digging through the headers as a driver author, however, you'll also want to have a look at include/media/v4l2-dev.h, which defines many of the structures you'll be working with.
+
+A video driver will probably have sections which deal with the PCI or USB bus (for example); we'll not spend much time on that part of the driver here. There is often an internal i2c interface, which will be examined later on in this article series. Then, there is the interface to the V4L2 subsystem. That interface is built around struct video_device, which represents a V4L2 device. Covering everything that goes into this structure will be the topic of several articles; here we'll just have an overview.
+
+The name field of struct video_device is a name for the type of device; it will appear in kernel log messages and in sysfs. The name usually matches the name of the driver.
+
+There are two fields to describe what type of device is being represented. The first (type) looks like a holdover from the Video4Linux1 API; it can have one of four values:
+
+VFL_TYPE_GRABBER indicates a frame grabber device - including cameras, tuners, and such.
+VFL_TYPE_VBI is for devices which pull information transmitted during the video blanking interval.
+VFL_TYPE_RADIO for radio devices.
+VFL_TYPE_VTX for videotext devices.
+If your device can perform more than one of the above functions, a separate V4L2 device should be registered for each of the supported functions. In V4L2, however, any of the registered devices can be called upon to function in any of the supported modes. What it comes down to is that, for V4L2, there is really only need for a single device, but compatibility with the older Video4Linux API requires that individual devices be registered for each function.
+
+The second field, called type2, is a bitmask describing the device's capabilities in more detail. It can contain any of the following values:
+
+VID_TYPE_CAPTURE: the device can capture video data.
+VID_TYPE_TUNER: it can tune to different frequencies.
+VID_TYPE_TELETEXT: it can grab teletext data.
+VID_TYPE_OVERLAY: it can overlay video data directly into the frame buffer.
+VID_TYPE_CHROMAKEY: a special form of overlay capability where the video data is only displayed where the underlying frame buffer contains pixels of a specific color.
+VID_TYPE_CLIPPING: it can clip overlay data.
+VID_TYPE_FRAMERAM: it uses memory located in the frame buffer device.
+VID_TYPE_SCALES: it can scale video data.
+VID_TYPE_MONOCHROME: it is a monochrome-only device.
+VID_TYPE_SUBCAPTURE: it can capture sub-areas of the image.
+VID_TYPE_MPEG_DECODER: it can decode MPEG streams.
+VID_TYPE_MPEG_ENCODER: it can encode MPEG streams.
+VID_TYPE_MJPEG_DECODER: it can decode MJPEG streams.
+VID_TYPE_MJPEG_ENCODER: it can encode MJPEG streams.
+Another field initialized by all V4L2 drivers is minor, which is the desired minor number for the device. Usually this field will be set to -1, which causes the Video4Linux subsystem to allocate a minor number at registration time.
+
+There are also three distinct sets of function pointers found within struct video_device. The first, consisting of a single function, is the release() method. If a device lacks a release() function, the kernel will complain (your editor was amused to note that it refers offending programmers to an LWN article). The release() function is important: for various reasons, references to a video_device structure can remain long after that last video application has closed its file descriptor. Those references can remain after the device has been unregistered. For this reason, it is not safe to free the structure until the release() method has been called. So, often, this function consists of a simple kfree() call.
+
+The video_device structure contains within it a file_operations structure with the usual function pointers. Video drivers will always need open() and release() operations; note that this release() is called whenever the device is closed, not when it can be freed as with the other function with the same name described above. There will often be a read() or write() method, depending on whether the device performs input or output; note, however, that for streaming video devices, there are other ways of transferring data. Most devices which handle streaming video data will need to implement poll() and mmap(). And every V4l2 device needs an ioctl() method - but they can use video_ioctl2(), which is provided by the V4L2 subsystem.
+
+The third set of methods, stored in the video_device structure itself, makes up the core of the V4L2 API. There are several dozen of them, handling various device configuration operations, streaming I/O, and more.
+
+Finally, a useful field to know from the beginning is debug. Setting it to either (or both - it's a bitmask) of V4L2_DEBUG_IOCTL and V4L2_DEBUG_IOCTL_ARG will yield a fair amount of debugging output which can help a befuddled programmer figure out why a driver and an application are failing to understand each other.
+
+Video device registration
+Once the video_device structure has been set up, it should be registered with:
+
+    int video_register_device(struct video_device *vfd, int type, int nr);
+Here, vfd is the device structure, type is the same value found in its type field, and nr is, again, the desired minor number (or -1 for dynamic allocation). The return value should be zero; a negative error code indicates that something went badly wrong. As always, one should be aware that the device's methods can be called immediately once the device is registered; do not call video_register_device() until everything is ready to go.
+
+A device can be unregistered with:
+
+    void video_unregister_device(struct video_device *vfd);
+Stay tuned for the next article in this series, which will begin to look at the implementation of some of these methods.
+
+open() and release()
+Every V4L2 device will need an open() method, which will have the usual prototype:
+
+    int (*open)(struct inode *inode, struct file *filp);
+The first thing an open() method will normally do is to locate an internal device corresponding to the given inode; this is done by keying on the minor number stored in inode. A certain amount of initialization can be performed; this can also be a good time to power up the hardware if it has a power-down option.
+
+The V4L2 specification defines some conventions which are relevant here. One is that, by design, all V4L2 devices can have multiple open file descriptors at any given time. The purpose here is to allow one application to display (or generate) video data while another one, perhaps, tweaks control values. So, while certain V4L2 operations (actually reading and writing video data, in particular) can be made exclusive to a single file descriptor, the device as a whole should support multiple open descriptors.
+
+Another convention worth mentioning is that the open() method should not, in general, make changes to the operating parameters currently set in the hardware. It should be possible to run a command-line program which configures a camera according to a certain set of desires (resolution, video format, etc.), then run an entirely separate application to, for example, capture a frame from the camera. This mode would not work if the camera's settings were reset in the middle, so a V4L2 driver should endeavor to keep existing settings until an application explicitly resets them.
+
+The release() method performs any needed cleanup. Since video devices can have multiple open file descriptors, release() will need to decrement a counter and check before doing anything radical. If the just-closed file descriptor was being used to transfer data, it may necessary to shut down the DMA engine and perform other cleanups.
+
+The next installment in this series will start into the long process of querying device capabilities and configuring operating modes. Stay tuned.
+
+Video4Linux2 part 3: Basic ioctl() handling
+[Posted October 30, 2006 by corbet]
+
+Anybody who has spent any amount of time working through the Video4Linux2 API specification will have certainly noted that V4L2 makes heavy use of the ioctl() interface. Perhaps more than just about any other type of peripheral, video hardware has a vast number of knobs to tweak. Video streams have many parameters associated with them, and, often, there is quite a bit of processing done in the hardware. Trying to operate video hardware outside of its well-supported modes can lead to poor performance at best, and often no performance at all. So there is no alternative to exposing many of the hardware's features and quirks to the end application.
+Traditionally, video drivers have included ioctl() functions of approximately the same length as a Neal Stephenson novel; while the functions often come to more satisfying conclusions than the novels, they do tend to drag a lot in the middle. So the V4L2 API was changed in 2.6.18; the interminable ioctl() function has been replaced with a large set of callbacks which implement the individual ioctl() functions. There are, in fact, 79 of them in 2.6.19-rc3. Fortunately, most drivers need not implement all - or even most - of the possible callbacks.
+
+What has really happened is that the long ioctl() function has been moved into drivers/media/video/videodev.c. This code handles the movement of data between user and kernel space and dispatches individual ioctl() calls to the driver. To use it, the driver need only use video_ioctl2() as its ioctl() method in the video_device structure. Actually, most drivers should be able to use it as unlocked_ioctl() instead; the locking within the Video4Linux2 layer can handle it, and drivers should have proper locking in place as well.
+
+The first callback your driver is likely to implement is:
+
+    int (*vidioc_querycap)(struct file *file, void *priv,
+                           struct v4l2_capability *cap);
+This function handles the VIDIOC_QUERYCAP ioctl(), which asks a simple "who are you and what can you do?" question. Implementing it is mandatory for V4L2 drivers. In this function, as with all other V4L2 callbacks, the priv argument is the contents of file->private_data field; the usual practice is to point it at the driver's internal structure representing the device at open() time.
+
+The driver should respond by filling in the structure cap and returning the usual "zero or negative error code" value. On successful return, the V4L2 layer will take care of copying the response back into user space.
+
+The v4l2_capability structure (defined in <linux/videodev2.h>) looks like this:
+
+    struct v4l2_capability
+    {
+	__u8	driver[16];	/* i.e. "bttv" */
+	__u8	card[32];	/* i.e. "Hauppauge WinTV" */
+	__u8	bus_info[32];	/* "PCI:" + pci_name(pci_dev) */
+	__u32   version;        /* should use KERNEL_VERSION() */
+	__u32	capabilities;	/* Device capabilities */
+	__u32	reserved[4];
+    };
+The driver field should be filled in with the name of the device driver, while the card field should have a description of the hardware behind this particular device. Not all drivers bother with the bus_info field; those that do usually use something like:
+
+    sprintf(cap->bus_info, "PCI:%s", pci_name(&my_dev));
+The version field holds a version number for the driver. The capabilities field is a bitmask describing various things that the driver can do:
+
+V4L2_CAP_VIDEO_CAPTURE: The device can capture video data.
+V4L2_CAP_VIDEO_OUTPUT: The device can perform video output.
+V4L2_CAP_VIDEO_OVERLAY: It can do video overlay onto the frame buffer.
+V4L2_CAP_VBI_CAPTURE: It can capture raw video blanking interval data.
+V4L2_CAP_VBI_OUTPUT: It can do raw VBI output.
+V4L2_CAP_SLICED_VBI_CAPTURE: It can do sliced VBI capture.
+V4L2_CAP_SLICED_VBI_OUTPUT: It can do sliced VBI output.
+V4L2_CAP_RDS_CAPTURE: It can capture Radio Data System (RDS) data.
+V4L2_CAP_TUNER: It has a computer-controllable tuner.
+V4L2_CAP_AUDIO: It can capture audio data.
+V4L2_CAP_RADIO: It is a radio device.
+V4L2_CAP_READWRITE: It supports the read() and/or write() system calls; very few devices will support both. It makes little sense to write to a camera, normally.
+V4L2_CAP_ASYNCIO: It supports asynchronous I/O. Unfortunately, the V4L2 layer as a whole does not yet support asynchronous I/O, so this capability is not meaningful.
+V4L2_CAP_STREAMING: It supports ioctl()-controlled streaming I/O.
+The final field (reserved) should be left alone. The V4L2 specification requires that reserved be set to zero, but, since video_ioctl2() sets the entire structure to zero, that is nicely taken care of.
+
+A fairly typical implementation can be found in the "vivi" driver:
+
+    static int vidioc_querycap (struct file *file, void  *priv,
+					struct v4l2_capability *cap)
+    {
+	strcpy(cap->driver, "vivi");
+	strcpy(cap->card, "vivi");
+	cap->version = VIVI_VERSION;
+	cap->capabilities =	V4L2_CAP_VIDEO_CAPTURE |
+				V4L2_CAP_STREAMING     |
+				V4L2_CAP_READWRITE;
+	return 0;
+    }
+Given the presence of this call, one would expect that applications would use it and avoid asking specific devices to perform functions that they are not capable of. In your editor's limited experience, however, applications tend not to pay much attention to the VIDIOC_QUERYCAP call.
+
+Another callback, which is optional and not often implemented, is:
+
+    int (*vidioc_log_status) (struct file *file, void *priv);
+This function, implementing VIDIOC_LOG_STATUS, is intended to be a debugging aid for video application writers. When called, it should print information describing the current status of the driver and its hardware. This information should be sufficiently verbose to help a confused application developer figure out why the video display is coming up blank. Your editor would also recommend, however, that it be moderated with a call to printk_ratelimit() to keep it from being used to slow the system and fill the logfiles with junk.
+
+The next installment will start in on the remaining 77 callbacks. In particular, we will begin to look at the long process of negotiating a set of operating modes with the hardware.
+
+Video4Linux2 part 4: inputs and outputs
+[Posted December 13, 2006 by corbet]
+
+This is the fourth article in the irregular LWN series on writing video drivers for Linux. Those who have not yet read the introductory article may want to start there. This week's episode describes how an application can determine which inputs and outputs are available on a given adapter and select between them.
+In many cases, a video adapter does not provide a lot of input and output options. A camera controller, for example, may provide the camera and little else. In other cases, however, the situation is more complicated. A TV card might have multiple inputs corresponding to different connectors on the board; it could even have multiple tuners capable of functioning independently. Sometimes those inputs have different characteristics; some might be able to tune to a wider range of video standards than others. The same holds for outputs.
+
+Clearly, for an application to be able to make full use of a video adapter, it must be able to find out about the available inputs and outputs, and it must be able to select the one it wishes to operate with. To that end, the Video4Linux2 API offers three different ioctl() calls for dealing with inputs, and an equivalent three for outputs. Drivers should implement all three (for each functionality supported by the hardware), even though, for simple hardware, the corresponding code can be quite simple. Drivers should also provide reasonable defaults on startup. What a driver should not do, however, is reset input and output information when an application exits; as with other video parameters, these settings should be left unchanged between opens.
+
+Video standards
+Before we can get into the details of inputs and outputs, however, we must have a look at video standards. These standards describe how a video signal is formatted for transmission - resolution, frame rates, etc. These standards are usually set by regulatory authorities in each country. There are three major types of video standard used in the world: NTSC (used in North America, primarily), PAL (much of Europe, Africa, and Asia), and SECAM (France, Russia, parts of Africa). There are, however, variations in the standards from one country to the next, and some devices are more flexible than others in the variants they can work with.
+
+The V4L2 layer represents video standards with the type v4l2_std_id, which is a 64-bit mask. Each standard variant is then one bit in the mask. So "standard" NTSC is V4L2_STD_NTSC_M, value 0x1000, but the Japanese variant is V4L2_STD_NTSC_M_JP (0x2000). If a device can handle all variants of NTSC, it can set a standard type of V4L2_STD_NTSC, which has all of the relevant bits set. Similar sets of bits exist for the variants of PAL and SECAM. See this page for a complete list.
+
+For user space, V4L2 provides an ioctl() command (VIDIOC_ENUMSTD) which allows an application to query which standards are implemented by a device. The driver does not need to answer those queries directly, however; instead, it simply sets the tvnorm field of the video_device structure with all of the standards that it supports. The V4L2 layer will then split out the supported standards for the application. The VIDIOC_G_STD command, used to query which standard is active at the moment, is also handled in the V4L2 layer by returning the value in the current_norm field of the video_device structure. The driver should, at startup, initialize current_norm to reflect reality; some applications will get confused if no standard is set, even though they have not set one.
+
+When an application wishes to request a specific standard, it will issue a VIDIOC_S_STD call, which is passed through to the driver via:
+
+    int (*vidioc_s_std) (struct file *file, void *private_data,
+                         v4l2_std_id std);
+The driver should program the hardware to use the given standard and return zero (or a negative error code). The V4L2 layer will handle setting current_norm to the new value.
+
+The application may want to know what kind of signal the hardware actually sees on its input. The answer can be found with VIDIOC_QUERYSTD, which reaches the driver as:
+
+    int (*vidioc_querystd) (struct file *file, void *private_data,
+                            v4l2_std_id *std);
+The driver should fill in this field in the greatest detail possible. If the hardware does not provide much information, the std field should indicate any of the standards which might be present.
+
+There is one more point worth noting here: all video devices must support (or at least claim to support) at least one standard. Video standards make little sense for camera devices, which are not tied to any specific regulatory regime. But there is no standard for "I'm a camera and can do almost anything you want." So the V4L2 layer has a number of camera drivers which claim to return PAL or NTSC data.
+
+Inputs
+A video acquisition application will start by enumerating the available inputs with the VIDIOC_ENUMINPUT command. Within the V4L2 layer, that command will be turned into a call to the driver's corresponding callback:
+
+    int (*vidioc_enum_input)(struct file *file, void *private_data,
+			     struct v4l2_input *input);
+In this call, file corresponds to the open video device, and private_data is the private field set by the driver. The input structure is where the real information is passed; it has several fields of interest:
+
+__u32 index: the index number of the input the application is interested in; this is the only field which will be set by user space. Drivers should assign index numbers to inputs, starting at zero and going up from there. An application wanting to know about all available inputs will call VIDIOC_ENUMINPUT with index numbers starting at zero and incrementing from there; once the driver returns EINVAL the application knows that it has exhausted the list. Input number zero should exist for all input-capable devices.
+__u8 name[32]: the name of the input, as set by the driver. In simple cases, it can simply be "Camera" or some such; if the card has multiple inputs, the name used here should correspond to what is printed by the connector.
+__u32 type: the type of input. There are currently only two: V4L2_INPUT_TYPE_TUNER and V4L2_INPUT_TYPE_CAMERA.
+__u32 audioset: describes which audio inputs can be associated with this video input. Audio inputs are enumerated by index number just like video inputs (we'll get to audio in another installment), but not all combinations of audio and video can be selected. This field is a bitmask with a bit set for each audio input which works with the video input being enumerated. If no audio inputs are supported, or if only a single input can be selected, the driver can simply leave this field as zero.
+__u32 tuner: if this input is a tuner (type is set to V4L2_INPUT_TYPE_TUNER), this field will contain an index number corresponding to the tuner device. Enumeration and control of tuners will be covered in a future installment too.
+v4l2_std_id std: describes which video standard(s) are supported by the device.
+__u32 status: gives the status of the input. The full set of flags can be found in the V4L2 documentation; in short, each bit set in status describes a problem. These can include no power, no signal, no synchronization lock, or the presence of Macrovision, among other unfortunate events.
+__u32 reserved[4]: reserved fields. Drivers should set them to zero.
+Normally, the driver will set all of the fields above and return zero. If index is outside the range of supported inputs, -EINVAL should be returned instead; there is not much else that can go wrong in this call.
+
+When the application wants to change the current input, the driver will receive a call to its vidioc_s_input() callback:
+
+    int (*vidioc_s_input) (struct file *file, void *private_data,
+                           unsigned int index);
+The index value has the same meaning as before - it identifies which input is of interest. The driver should program the hardware to use that input and return zero. Other possible return values are -EINVAL (for a bogus index number) or -EIO (for hardware trouble). Drivers should implement this callback even if they only support a single input.
+
+There is also a callback to query which input is currently active:
+
+    int (*vidioc_g_input) (struct file *file, void *private_data,
+                           unsigned int *index);
+Here, the driver sets *index to the index number of the currently active input.
+
+Outputs
+The process for enumerating and selecting outputs is very similar to that for inputs, so the description here will be a little more brief. The callback for output enumeration looks like this:
+
+    int (*vidioc_enumoutput) (struct file *file, void *private_data
+    			      struct v4l2_output *output);
+The fields of the v4l2_output structure are:
+
+__u32 index: the index value corresponding to the output. This index works the same way as the input index: it starts at zero and goes up from there.
+__u8 name[32]: the name of the output.
+__u32 type: the type of the output. The supported output types are V4L2_OUTPUT_TYPE_MODULATOR for an analog TV modulator, V4L2_OUTPUT_TYPE_ANALOG for basic analog video output, and V4L2_OUTPUT_TYPE_ANALOGVGAOVERLAY for analog VGA overlay devices.
+__u32 audioset: the set of audio outputs which can operate with this video output.
+__u32 modulator: the index of the modulator associated with this device (for those of type V4L2_OUTPUT_TYPE_MODULATOR).
+v4l2_std_id std: the video standards supported by this output.
+__u32 reserved[4]: reserved fields, should be set to zero.
+There are callbacks for getting and setting the current output setting; they mirror the input callbacks:
+
+    int (*vidioc_g_output) (struct file *file, void *private_data,
+                            unsigned int *index);
+    int (*vidioc_s_output) (struct file *file, void *private_data,
+                            unsigned int index);
+Any device which supports video output should have all three output callbacks defined, even if there is only one possible output.
+
+With these methods in place, a V4L2 application can determine which inputs and outputs are available on a given device and choose between them. The task of determining just what kind of video data flows through those inputs and outputs is rather more complicated, however. The next installment in this series will begin to look at video data formats and how to negotiate a format with user space.
+
+Video4Linux2 part 5a: colors and formats
+[Posted January 24, 2007 by corbet]
+
+This is the fifth article in the irregular LWN series on writing video drivers for Linux. Those who have not yet read the introductory article may want to start there.
+Before any application can work with a video device, it must come to an understanding with the driver about how video data will be formatted. This negotiation can be a rather complex process, resulting from the facts that (1) video hardware varies widely in the formats it can handle, and (2) performing format transformations in the kernel is frowned upon. So the application must be able to find out what formats are supported by the hardware and set up a configuration which is workable for everybody involved. This article will cover the basics of how formats are described; the next installment will get into the API implemented by V4L2 drivers to negotiate formats with applications.
+
+Colorspaces
+A colorspace is, in broad terms, the coordinate system used to describe colors. There are several of them defined by the V4L2 specification, but only two are used in any broad way. They are:
+
+V4L2_COLORSPACE_SRGB. The [red, green, blue] tuples familiar to many developers are covered under this colorspace. They provide a simple intensity value for each of the primary colors which, when mixed together, create the illusion of a wide range of colors. There are a number of ways of representing RGB values, as we will see below.
+This colorspace also covers the set of YUV and YCbCr representations. This representation derives from the need for early color television signals to be displayable on monochrome TV sets. So the Y (or "luminance") value is a simple brightness value; when displayed alone, it yields a grayscale image. The U and V (or Cb and Cr) "chrominance" values describe the blue and red components of the color; green can be derived by subtracting those components from the luminance. Conversion between YUV and RGB is not entirely straightforward, however; there are several formulas to choose from.
+
+Note that YUV and YCbCr are not exactly the same thing, though the terms are often used interchangeably.
+
+V4L2_COLORSPACE_SMPTE170M is for analog color representations used in NTSC or PAL television signals. TV tuners will often produce data in this colorspace.
+Quite a few other colorspaces exist; most of them are variants of television-related standards. See this page from the V4L2 specification for the full list.
+
+Packed and planar
+As we have seen, pixel values are expressed as tuples, usually consisting of RGB or YUV values. There are two commonly-used ways of organizing those tuples into an image:
+
+Packed formats store all of the values for one pixel together in memory.
+Planar formats separate each component out into a separate array. Thus a planar YUV format will have all of the Y values stored contiguously in one array, the U values in another, and the V values in a third. The planes are usually stored contiguously in a single buffer, but it does not have to be that way.
+Packed formats might be more commonly used, especially with RGB formats, but both types can be generated by hardware and requested by applications. If the video device supports both packed and planar formats, the driver should make them both available to user space.
+
+Fourcc codes
+Color formats are described within the V4L2 API using the venerable "fourcc" code mechanism. These codes are 32-bit values, generated from four ASCII characters. As such, they have the advantages of being easily passed around and being human-readable. When a color format code reads, for example, 'RGB4', there is no need to go look it up in a table.
+
+Note that fourcc codes are used in a lot of different settings, some of which predate Linux. The MPlayer application uses them internally. fourcc refers only to the coding mechanism, however, and says nothing about which codes are actually used - MPlayer has a translation function for converting between its fourcc codes and those used by V4L2.
+
+RGB formats
+In the format descriptions shown below, bytes are always listed in memory order - least significant bytes first on a little-endian machine. The least significant bit of each byte is on the right; for each color field, the lighter-shaded bit is the most significant.
+
+Name	fourcc	Byte 0	Byte 1	Byte 2	Byte 3
+V4L2_PIX_FORMAT_RGB332	RGB1
+
+V4L2_PIX_FORMAT_RGB444	R444
+
+
+V4L2_PIX_FORMAT_RGB555	RGB0
+
+
+V4L2_PIX_FORMAT_RGB565	RGBP
+
+
+V4L2_PIX_FORMAT_RGB555X	RGBQ
+
+
+V4L2_PIX_FORMAT_RGB565X	RGBR
+
+
+V4L2_PIX_FORMAT_BGR24	BGR3
+
+
+
+V4L2_PIX_FORMAT_RGB24	RGB3
+
+
+
+V4L2_PIX_FORMAT_BGR32	BGR4
+
+
+
+
+V4L2_PIX_FORMAT_RGB32	RGB4
+
+
+
+
+V4L2_PIX_FORMAT_SBGGR8	BA81
+
+
+
+
+
+
+
+
+When formats with empty space (shown in gray, above) are used, applications may use that space for an alpha (transparency) value.
+
+The final format above is the "Bayer" format, which is generally something very close to the real data from the sensor found in most cameras. There are green values for every pixel, but blue and red only for every other pixel. Essentially, green carries the more important intensity information, with red and blue being interpolated across the pixels where they are missing. This is a pattern we will see again with the YUV formats.
+
+YUV formats
+The packed YUV formats will be shown first. The key for reading this table is:
+
+
+= Y (intensity)
+
+= U (Cb)
+
+= V (Cr)
+Name	fourcc	Byte 0	Byte 1	Byte 2	Byte 3
+V4L2_PIX_FORMAT_GREY	GREY
+
+V4L2_PIX_FORMAT_YUYV	YUYV
+
+
+
+
+V4L2_PIX_FORMAT_UYVY	UYVY
+
+
+
+
+V4L2_PIX_FORMAT_Y41P	Y41P
+
+
+
+
+
+
+
+
+
+
+
+
+There are several planar YUV formats in use as well. Drawing them all out does not help much, so we'll go with one example. The commonly-used "YUV 4:2:2" format (V4L2_PIX_FMT_YUV422, fourcc 422P) uses three separate arrays. A 4x4 image would be represented like this:
+
+Y plane:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+U plane:
+
+
+
+
+
+
+
+
+
+V plane:
+
+
+
+
+
+
+
+
+As with the Bayer format, YUV 4:2:2 has one U and one V value for every other Y value; displaying the image requires interpolating across the missing values. The other planar YUV formats are:
+
+V4L2_PIX_FMT_YUV420: the YUV 4:2:0 format, with one U and one V value for every four Y values. U and V must be interpolated in both the horizontal and vertical directions. The planes are stored in Y-U-V order, as with the example above.
+V4L2_PIX_FMT_YVU420: like YUV 4:2:0, except that the positions of the U and V arrays are swapped.
+V4L2_PIX_FMT_YUV410: A single U and V value for each sixteen Y values. The arrays are in the order Y-U-V.
+V4L2_PIX_FMT_YVU410: A single U and V value for each sixteen Y values. The arrays are in the order Y-V-U.
+A few other YUV formats exist, but they are rarely used; see this page for the full list.
+
+Other formats
+A couple of formats which might be useful for some drivers are:
+
+V4L2_PIX_FMT_JPEG: a vaguely-defined JPEG stream; a little more information can be found here.
+V4L2_PIX_FMT_MPEG: an MPEG stream. There are a few variants on the MPEG stream format; controlling these streams will be discussed in a future installment.
+There are a number of other, miscellaneous formats, some of them proprietary; this page has a list of them.
+
+Describing formats
+Now that we have an understanding of color formats, we can take a look at how the V4L2 API describes image formats in general. The key structure here is struct v4l2_pix_format (defined in <linux/videodev2.h>, which contains these fields:
+
+__u32 width: the width of the image in pixels.
+__u32 height: the height of the image in pixels.
+__u32 pixelformat: the fourcc code describing the image format.
+enum v4l2_field field: many image sources will interlace the data - transferring all of the even scan lines first, followed by the odd lines. Real camera devices normally do not do interlacing. The V4L2 API allows the application to work with interlaced fields in a surprising number of ways. Common values include V4L2_FIELD_NONE (fields are not interlaced), V4l2_FIELD_TOP (top field only), or V4L2_FIELD_ANY (don't care). See this page for a full list.
+__u32 bytesperline: the number of bytes between two adjacent scan lines. It includes any padding the device may require. For planar formats, this value describes the largest (Y) plane.
+__u32 sizeimage: the size of the buffer required to hold the full image.
+enum v4l2_colorspace colorspace: the colorspace being used.
+All together, these parameters describe a buffer of video data in a reasonably complete manner. An application can fill out a v4l2_pix_format structure asking for just about any sort of format that a user-space developer can imagine. On the driver side, however, things have to be restrained to the formats the hardware can work with. So every V4L2 application must go through a negotiation process with the driver in an attempt to arrive at an image format that is both supported by the hardware and adequate for the application's needs. The next installment in this series will describe how this negotiation works from the device driver's point of view.
+
+Video4Linux2 part 5b: format negotiation
+[Posted March 23, 2007 by corbet]
+
+This article is a continuation of the irregular LWN series on writing video drivers for Linux. The introductory article describes the series and contains pointers to the previous articles. In the last episode, we looked at how the Video4Linux2 API describes video formats: image sizes and the representation of pixels within them. This article will complete the discussion by describing the process of coming to an agreement with an application on an actual video format supported by the hardware.
+As we saw in the previous article, there are many ways of representing image data in memory. There is probably no video device on the market which can handle all of the formats understood by the Video4Linux interface. Drivers are not expected to support formats not understood by the underlying hardware; in fact, performing format conversions within the kernel is explicitly frowned upon. So the driver must make it possible for the application to select a format which works with the hardware.
+
+The first step is to simply allow the application to query the supported formats. The VIDIOC_ENUM_FMT ioctl() is provided for the purpose; within the driver this command turns into a call to this callback (if a video capture device is being queried):
+
+    int (*vidioc_enum_fmt_cap)(struct file *file, void *private_data,
+			       struct v4l2_fmtdesc *f);
+This callback will ask a video capture device to describe one of its formats. The application will pass in a v4l2_fmtdesc structure:
+
+    struct v4l2_fmtdesc
+    {
+	__u32		    index;
+	enum v4l2_buf_type  type;
+	__u32               flags;
+	__u8		    description[32];
+	__u32		    pixelformat;
+	__u32		    reserved[4];
+    };
+The application will set the index and type fields. index is a simple integer used to identify a format; like the other indexes used by V4L2, this one starts at zero and increases to the maximum number of formats supported. An application can enumerate all of the supported formats by incrementing the index value until the driver returns EINVAL. The type field describes the data stream type; it will be V4L2_BUF_TYPE_VIDEO_CAPTURE for a video capture (camera or tuner) device.
+
+If the index corresponds to a supported format, the driver should fill in the rest of the structure. The pixelformat field should be the fourcc code describing the video representation and description a short textual description of the format. The only defined value for the flags field is V4L2_FMT_FLAG_COMPRESSED, which indicates a compressed video format.
+
+The above callback is for video capture devices; it will only be called when type is V4L2_BUF_TYPE_VIDEO_CAPTURE. The VIDIOC_ENUM_FMT call will be split out into different callbacks depending on the type field:
+
+    /* V4L2_BUF_TYPE_VIDEO_OUTPUT */
+    int (*vidioc_enum_fmt_video_output)(file, private_date, f);
+
+    /* V4L2_BUF_TYPE_VIDEO_OVERLAY */
+    int (*vidioc_enum_fmt_overlay)(file, private_date, f);
+
+    /* V4L2_BUF_TYPE_VBI_CAPTURE */
+    int (*vidioc_enum_fmt_vbi)(file, private_date, f);
+
+    /* V4L2_BUF_TYPE_SLICED_VBI_CAPTURE */ */
+    int (*vidioc_enum_fmt_vbi_capture)(file, private_date, f);
+
+    /* V4L2_BUF_TYPE_VBI_OUTPUT */
+    /* V4L2_BUF_TYPE_SLICED_VBI_OUTPUT */
+    int (*vidioc_enum_fmt_vbi_output)(file, private_date, f);
+
+    /* V4L2_BUF_TYPE_VIDEO_PRIVATE */
+    int (*vidioc_enum_fmt_type_private)(file, private_date, f);
+The argument types are the same for all of these calls. It's worth noting that drivers can support special buffer types with codes starting with V4L2_BUF_TYPE_PRIVATE, but that would clearly require a special understanding on the application side. For the purposes of this article, we will focus on video capture and output devices; the other types of video devices will be examined in future installments.
+
+The application can find out how the hardware is currently configured with the VIDIOC_G_FMT call. The argument passed in this case is a v4l2_format structure:
+
+    struct v4l2_format
+    {
+	enum v4l2_buf_type type;
+	union
+	{
+		struct v4l2_pix_format		pix;
+		struct v4l2_window		win;
+		struct v4l2_vbi_format		vbi;
+		struct v4l2_sliced_vbi_format	sliced;
+		__u8	raw_data[200];
+	} fmt;
+    };
+Once again, type describes the buffer type; the V4L2 layer will split this call into one of several driver callbacks depending on that type. For video capture devices, the callback is:
+
+    int (*vidioc_g_fmt_cap)(struct file *file, void *private_data,
+    			    struct v4l2_format *f);
+For video capture (and output) devices, the pix field of the union is of interest. This is the v4l2_pix_format structure seen in the previous installment; the driver should fill in that structure with the current hardware settings and return. This call should not normally fail unless something is seriously wrong with the hardware.
+
+The other callbacks are:
+
+    int (*vidioc_s_fmt_overlay)(file, private_data, f);
+    int (*vidioc_s_fmt_video_output)(file, private_data, f);
+    int (*vidioc_s_fmt_vbi)(file, private_data, f);
+    int (*vidioc_s_fmt_vbi_output)(file, private_data, f);
+    int (*vidioc_s_fmt_vbi_capture)(file, private_data, f);
+    int (*vidioc_s_fmt_type_private)(file, private_data, f);
+The vidioc_s_fmt_video_output() callback uses the same pix field in the same way as capture interfaces do.
+
+Most applications will eventually want to configure the hardware to provide a format which works for their purpose. There are two interfaces provided for changing video formats. The first of these is the VIDIOC_TRY_FMT call, which, within a V4L2 driver, turns into one of these callbacks:
+
+    int (*vidioc_try_fmt_cap)(struct file *file, void *private_data,
+			      struct v4l2_format *f);
+    int (*vidioc_try_fmt_video_output)(struct file *file, void *private_data,
+			      	       struct v4l2_format *f);
+    /* And so on for the other buffer types */
+To handle this call, the driver should look at the requested video format and decide whether that format can be supported by the hardware or not. If the application has requested something impossible, the driver should return -EINVAL. So, for example, a fourcc code describing an unsupported format or a request for interlaced video on a progressive-only device would fail. On the other hand, the driver can adjust size fields to match an image size supported by the hardware; normal practice is to adjust sizes downward if need be. So a driver for a device which only handles VGA-resolution images would change the width and height parameters accordingly and return success. The v4l2_format structure will be copied back to user space after the call; the driver should update the structure to reflect any changed parameters so the application can see what it is really getting.
+
+The VIDIOC_TRY_FMT handlers are optional for drivers, but omitting this functionality is not recommended. If provided, this function is callable at any time, even if the device is currently operating. It should not make any changes to the actual hardware operating parameters; it is just a way for the application to find out what is possible.
+
+When the application wants to change the hardware's format for real, it does a VIDIOC_S_FMT call, which arrives at the driver in this form:
+
+    int (*vidioc_s_fmt_cap)(struct file *file, void *private_data,
+    			    struct v4l2_format *f);
+    int (*vidioc_s_fmt_video_output)(struct file *file, void *private_data,
+    			             struct v4l2_format *f);
+Unlike VIDIOC_TRY_FMT, this call cannot be made at arbitrary times. If the hardware is currently operating, or if it has streaming buffers allocated (a topic for yet another future installment), changing the format could lead to no end of mayhem. Consider what happens, for example, if the new format is larger than the buffers which are currently in use. So the driver should always ensure that the hardware is idle and fail the request (with -EBUSY) if not.
+
+A format change should be atomic - it should change all of the parameters to match the request or none of them. Once again, image size parameters can be adjusted by the driver if need be. The usual form of these callbacks is something like this:
+
+    int my_s_fmt_cap(struct file *file, void *private,
+                     struct v4l2_format *f)
+    {
+	struct mydev *dev = (struct mydev *) private;
+	int ret;
+
+	if (hardware_busy(mydev))
+	    return -EBUSY;
+	ret = my_try_fmt_cap(file, private, f);
+	if (ret != 0)
+	    return ret;
+	return tweak_hardware(mydev, &f->fmt.pix);
+    }
+Using the VIDIOC_TRY_FMT handler avoids duplication of code and gets rid of any excuse for not implementing that handler in the first place. If the "try" function succeeds, the resulting format is known to work and can be programmed directly into the hardware.
+
+There are a number of other calls which influence how video I/O is done. Future articles will look at some of them. Support for setting formats is enough to enable applications to start transferring images, however, and that is what the purpose of all this structure is in the end. So the next article, hopefully to come after a shorter delay than happened this time around, will get into support for reading and writing video data.
+
+Video4Linux2 part 6a: Basic frame I/O
+[Posted May 18, 2007 by corbet]
+
+This series of articles on video drivers has been through several installments, but we have yet to transfer a single frame of video data. At this point, though, we have covered enough of the format negotiation details that we can begin to look at how video frames move between the application and device.
+The Video4Linux2 API defines three different ways of transferring video frames, two of which are actually available in the current implementation:
+
+The read() and write() system calls can be used in the normal way. Depending on the hardware and how the driver is implemented, this technique might be relatively slow - but it does not have to be that way.
+Frames can be streamed directly to and from buffers accessible to the application. Streaming is usually the most efficient way to move video data; this interface also allows for the transfer of some useful metadata with the image frames. There are two variants of the streaming technique, depending on whether the buffers are located in user or kernel space.
+The Video4Linux2 API specification provides for an asynchronous I/O mechanism for frame transfer. This mode has not been implemented, however, and cannot be used.
+This article will look at the simple read() and write() interface; streaming transfers will be covered in the next installment.
+
+read() and write()
+Implementation of read() and write() is not required by the Video4Linux2 specification. Many simpler applications expect these system calls to be available, though, so, if possible, the driver writer should make them work. If the driver does support these calls, it should be sure to set the V4L2_CAP_READWRITE bit in response to a VIDIOC_QUERYCAP call (described in part 3). In your editor's experience, however, most applications do not bother to check whether these calls are available before attempting to use them.
+
+The driver's read() and/or write() methods must be stored in the fops field of the associated video_device structure. Note that the Video4Linux2 specification requires drivers implementing these methods to provide a poll() operation as well.
+
+A naive implementation of read() on a frame grabber device is straightforward: the driver tells the hardware to start capturing frames, delivers one to the user-space buffer, stops the hardware, and returns. If possible, the driver should arrange for the DMA operation to transfer the data directly to the destination buffer, but that is only possible if the controller can handle scatter/gather I/O. Otherwise, the driver will need to buffer the frame through the kernel. Similarly, write operations should go directly to the device if possible, but be buffered through the kernel otherwise.
+
+Less simplistic implementations are possible. Your editor's "Cafe" driver, for example, leaves the camera controller running in a speculative mode after a read() operation. For the next fraction of a second, subsequent frames from the camera will be buffered in the kernel; if the application issues another read() call, it will be satisfied more quickly without the need to start up the hardware again. After a number of unclaimed frames the controller is put back into an idle state. Similarly, a write() operation could delay the first frame by a few tens of milliseconds with the idea of helping the application stream frames at the hardware's expected rate.
+
+Streaming parameters
+The VIDIOC_G_PARM and VIDIOC_S_PARM ioctl() calls adjust some parameters which are specific to read() and write() implementations - and some which are more general. It appears to be a call where miscellaneous options with no obvious home were put. We'll cover it here, even though some of the parameters affect streaming I/O as well.
+
+Video4Linux2 drivers supporting these calls provide the following two methods:
+
+    int (*vidioc_g_parm) (struct file *file, void *private_data,
+    			  struct v4l2_streamparm *parms);
+    int (*vidioc_s_parm) (struct file *file, void *private_data,
+			  struct v4l2_streamparm *parms);
+The v4l2_streamparm structure contains one of those unions which should be getting familiar to readers of this series by now:
+
+    struct v4l2_streamparm
+    {
+	enum v4l2_buf_type type;
+	union
+	{
+		struct v4l2_captureparm	capture;
+		struct v4l2_outputparm	output;
+		__u8 raw_data[200];
+	} parm;
+    };
+The type field describes the type of operation to be affected; it will be V4L2_BUF_TYPE_VIDEO_CAPTURE for capture devices and V4L2_BUF_TYPE_VIDEO_OUTPUT for output devices. It can also be V4L2_BUF_TYPE_PRIVATE, in which case the raw_data field is used to pass some sort of private, non-portable, probably discouraged data through to the driver.
+
+For capture devices, the parm.capture field will be of interest. That structure looks like this:
+
+    struct v4l2_captureparm
+    {
+	__u32		   capability;
+	__u32		   capturemode;
+	struct v4l2_fract  timeperframe;
+	__u32		   extendedmode;
+	__u32              readbuffers;
+	__u32		   reserved[4];
+    };
+capability is a set of capability flags; the only one currently defined is V4L2_CAP_TIMEPERFRAME which indicates that the device can vary its frame rate. capturemode is another flag field with exactly one flag defined: V4L2_MODE_HIGHQUALITY, intended to put the hardware into a high-quality mode suitable for single-frame captures. This mode can make any number of sacrifices (in terms of the data formats supported, exposure times, etc.) in order to get the best image quality that the device can handle.
+
+The timeperframe field is used to specify the desired frame rate. It is yet another structure:
+
+    struct v4l2_fract {
+	__u32   numerator;
+	__u32   denominator;
+    };
+The quotient described by numerator and denominator gives the time between successive frames on the device. Another driver-specific field is extendedmode, which has no defined meaning in the API. The readbuffers field is the number of buffers the kernel should use for incoming frames when the read() method is being used.
+
+For video output devices, the structure looks like:
+
+    struct v4l2_outputparm
+    {
+	__u32		   capability;
+	__u32		   outputmode;
+	struct v4l2_fract  timeperframe;
+	__u32		   extendedmode;
+	__u32              writebuffers;
+	__u32		   reserved[4];
+    };
+The capability, timeperframe, and extendedmode fields are exactly the same as for capture devices. outputmode and writebuffers have the same effect as capturemode and readbuffers, respectively.
+
+When the application wishes to query the current parameters, it will issue a VIDIOC_G_PARM call, resulting in a call to the driver's vidioc_g_parm() method. The driver should provide the current settings, being sure to set the extendedmode field to zero if it is not being used, and the reserved field to zero always.
+
+An attempt to set the parameters results in a call to vidioc_s_parm(). In this case, the driver should set the parameters as closely as possible to the application's request and adjust the v4l2_streamparm structure to reflect the values which were actually used. For example, the application might request a higher frame rate than the hardware can provide; in this case, the fastest possible rate should be programmed and the timeperframe field set to the actual frame rate.
+
+If timeperframe is given as zero by the application, the driver should program the nominal frame rate associated with the current video norm. If readbuffers or writebuffers is zero, the driver should return the current settings rather than getting rid of the current buffers.
+
+At this point, we have covered enough to write a simple driver supporting frame transfer with read() or write(). Most serious applications will want to use streaming I/O, however: the streaming mode makes higher performance easier, and it allows frames to be packaged with relevant metadata like sequence numbers. Tune in for the next installment in this series which will discuss how to implement the streaming API in video drivers.
+
+
+Video4Linux2 part 6b: Streaming I/O
+[Posted July 5, 2007 by corbet]
+
+The previous installment in this series discussed how to transfer video frames with the read() and write() system calls. Such an implementation can get the basic job done, but it is not normally the preferred method for performing video I/O. For the highest performance and the best information transfer, video drivers should support the V4L2 streaming I/O API.
+With the read() and write() methods, each video frame is copied between user and kernel space as part of the I/O operation. When streaming I/O is being used, instead, this copying does not happen; instead, the application and the driver exchange pointers to buffers. These buffers will be mapped into the application's address space, making it possible to perform zero-copy frame I/O. There are two different types of streaming I/O buffers:
+
+Memory-mapped buffers (type V4L2_MEMORY_MMAP) are allocated in kernel space; the application maps them into its address space with the mmap() system call. The buffers can be large, contiguous DMA buffers, virtual buffers created with vmalloc(), or, if the hardware supports it, they can be located directly in the video device's I/O memory.
+User-space buffers (V4L2_MEMORY_USERPTR) are allocated by the application in user space. Clearly, in this situation, no mmap() call is required, but the driver may have to work harder to support efficient I/O to user-space buffers.
+Note that drivers are not required to support streaming I/O, and, if they do support streaming, they do not have to handle both buffer types. A driver which is more flexible will support more applications; in practice, it seems that most applications are written to use memory-mapped buffers. It is not possible to use both types of buffer simultaneously.
+
+We will now delve into the numerous grungy details involved in supporting streaming I/O. Any Video4Linux2 driver writer will need to understand this API; it is worth noting, however, that there is a higher-level API which can help in the writing of streaming drivers. That layer (called video-buf) can make life easier when the underlying device can support scatter/gather I/O. The video-buf API will be discussed in a future installment.
+
+Drivers which support streaming I/O should inform the application of that fact by setting the V4L2_CAP_STREAMING flag in their vidioc_querycap() method. Note that there is no way to describe which buffer types are supported; that comes later.
+
+The v4l2_buffer structure
+When streaming I/O is active, frames are passed between the application and the driver in the form of struct v4l2_buffer. This structure is a complicated beast which will take a while to describe. A good starting point is to note that there are three fundamental states that a buffer can be in:
+
+In the driver's incoming queue. Buffers are placed in this queue by the application in the expectation that the driver will do something useful with them. For a video capture device, buffers in the incoming queue will be empty, waiting for the driver to fill them with video data. For an output device, these buffers will have frame data to be sent to the device.
+In the driver's outgoing queue. These buffers have been processed by the driver and are waiting for the application to claim them. For capture devices, outgoing buffers will have new frame data; for output devices, these buffers are empty.
+In neither queue. In this state, the buffer is owned by user space and will not normally be touched by the driver. This is the only time that the application should do anything with the buffer. We'll call this the "user space" state.
+These states, and the operations which cause transitions between them, come together as shown in the diagram below:
+		___________________________
+	       |	user space	   |
+	       |___________________________|
+		|			 ^	
+		|VIDIOC_QBUF		 |VIDIOC_DQBUF
+		Y	  (I/O)		 |
+		Incoming  ---->   Outgoing
+
+[Buffer states]
+The actual v4l2_buffer structure looks like this:
+
+    struct v4l2_buffer
+    {
+	__u32			index;
+	enum v4l2_buf_type      type;
+	__u32			bytesused;
+	__u32			flags;
+	enum v4l2_field		field;
+	struct timeval		timestamp;
+	struct v4l2_timecode	timecode;
+	__u32			sequence;
+
+	/* memory location */
+	enum v4l2_memory        memory;
+	union {
+		__u32           offset;
+		unsigned long   userptr;
+	} m;
+	__u32			length;
+	__u32			input;
+	__u32			reserved;
+    };
+The index field is a sequence number identifying the buffer; it is only used with memory-mapped buffers. Like other objects which can be enumerated in the V4L2 interface, memory-mapped buffers start with index 0 and go up sequentially from there. The type field describes the type of the buffer, usually V4L2_BUF_TYPE_VIDEO_CAPTURE or V4L2_BUF_TYPE_VIDEO_OUTPUT.
+
+The size of the buffer is given by length, which is in bytes. The size of the image data contained within the buffer is found in bytesused; obviously bytesused <= length. For capture devices, the driver will set bytesused; for output devices the application must set this field.
+
+field describes which field of an image is stored in the buffer; fields were discussed in part 5a of this series.
+
+The timestamp field, for input devices, tells when the frame was captured. For output devices, the driver should not send the frame out before the time found in this field; a timestamp of zero means "as soon as possible." The driver will set timestamp to the time that the first byte of the frame was transferred to the device - or as close to that time as it can get. timecode can be used to hold a timecode value, useful for video editing applications; see this table for details on timecodes.
+
+The driver maintains a incrementing count of frames passing through the device; it stores the current sequence number in sequence as each frame is transferred. For input devices, the application can watch this field to detect dropped frames.
+
+memory tells whether the buffer is memory-mapped or user-space. For memory-mapped buffers, m.offset describes where the buffer is to be found. The specification describes it as "the offset of the buffer from the start of the device memory," but the truth of the matter is that it is simply a magic cookie that the application can pass to mmap() to specify which buffer is being mapped. For user-space buffers, instead, m.userptr is the user-space address of the buffer.
+
+The input field can be used to quickly switch between inputs on a capture device - assuming the device supports quick switching between frames. The reserved field should be set to zero.
+
+Finally, there are several flags defined:
+
+V4L2_BUF_FLAG_MAPPED indicates that the buffer has been mapped into user space. It is only applicable to memory-mapped buffers.
+V4L2_BUF_FLAG_QUEUED: the buffer is in the driver's incoming queue.
+V4L2_BUF_FLAG_DONE: the buffer is in the driver's outgoing queue.
+V4L2_BUF_FLAG_KEYFRAME: the buffer holds a key frame - useful in compressed streams.
+V4L2_BUF_FLAG_PFRAME and V4L2_BUF_FLAG_BFRAME are also used with compressed streams; they indicated predicted or difference frames.
+V4L2_BUF_FLAG_TIMECODE: the timecode field is valid.
+V4L2_BUF_FLAG_INPUT: the input field is valid.
+Buffer setup
+Once a streaming application has performed its basic setup, it will turn to the task of organizing its I/O buffers. The first step is to establish a set of buffers with the VIDIOC_REQBUFS ioctl(), which is turned by V4L2 into a call to the driver's vidioc_reqbufs() method:
+
+    int (*vidioc_reqbufs) (struct file *file, void *private_data,
+			   struct v4l2_requestbuffers *req);
+Everything of interest will be in the v4l2_requestbuffers structure, which looks like this:
+
+    struct v4l2_requestbuffers
+    {
+	__u32			count;
+	enum v4l2_buf_type      type;
+	enum v4l2_memory        memory;
+	__u32			reserved[2];
+    };
+The type field describes the type of I/O to be done; it will usually be either V4L2_BUF_TYPE_VIDEO_CAPTURE for a video acquisition device or V4L2_BUF_TYPE_VIDEO_OUTPUT for an output device. There are other types, but they are beyond the scope of this article.
+
+If the application wants to use memory-mapped buffers, it will set memory to V4L2_MEMORY_MMAP and count to the number of buffers it wants to use. If the driver does not support memory-mapped buffers, it should return -EINVAL. Otherwise, it should allocate the requested buffers internally and return zero. On return, the application will expect the buffers to exist, so any part of the task which could fail (memory allocation, for example) should be done at this stage.
+
+Note that the driver is not required to allocate exactly the requested number of buffers. In many cases there is a minimum number of buffers which makes sense; if the application requests fewer than the minimum, it may actually get more buffers than it asked for. In your editor's experience, for example, the mplayer application will request two buffers, which makes it susceptible to overruns (and thus lost frames) if things slow down in user space. By enforcing a higher minimum buffer count (adjustable with a module parameter), the cafe_ccic driver is able to make the streaming I/O path a little more robust. The count field should be set to the number of buffers actually allocated before the method returns.
+
+Setting count to zero is a way for the application to request that all existing buffers be released. In this case, the driver must stop any DMA operations before freeing the buffers or terrible things could happen. It is also not possible to free buffers if they are current mapped into user space.
+
+If, instead, user-space buffers are to be used, the only fields which matter are the buffer type and a value of V4L2_MEMORY_USERPTR in the memory field. The application need not specify the number of buffers that it intends to use; since the allocation will be happening in user space, the driver need not care. If the driver supports user-space buffers, it need only note that the application will be using this feature and return zero; otherwise the usual -EINVAL return is called for.
+
+The VIDIOC_REQBUFS command is the only way for an application to discover which types of streaming I/O buffer are supported by a given driver.
+
+Mapping buffers into user space
+If user-space buffers are being used, the driver will not see any more buffer-related calls until the application starts putting buffers on the incoming queue. Memory-mapped buffers require more setup, though. The application will typically step through each allocated buffer and map it into its address space. The first stop is the VIDIOC_QUERYBUF command, which becomes a call to the driver's vidioc_querybuf() method:
+
+    int (*vidioc_querybuf)(struct file *file, void *private_data,
+                           struct v4l2_buffer *buf);
+On entry to this method, the only fields of buf which will be set are type (which should be checked against the type specified when the buffers were allocated) and index, which identifies the specific buffer. The driver should make sure that index makes sense and fill in the rest of the fields in buf. Typically drivers store an array of v4l2_buffer structures internally, so the core of a vidioc_querybuf() method is just a structure assignment.
+
+The only way for an application to access memory-mapped buffers is to map them into their address space, so a vidioc_querybuf() call will typically be followed by a call to the driver's mmap() method - this method, remember, is stored in the fops field of the video_device structure associated with this device. How the driver handles mmap() will depend on just how the buffers are set up in the kernel. If the buffer can be mapped up front with remap_pfn_range() or remap_vmalloc_range(), that should be done at this time. For buffers in kernel space, pages can also be mapped individually at page-fault time by setting up a nopage() method in the usual way. A good discussion of handling mmap() can be found in Linux Device Drivers for those who need it.
+
+When mmap() is called, the VMA structure passed in should have the address of one of your buffers in the vm_pgoff field - right-shifted by PAGE_SHIFT, of course. It should, in particular, be the offset value that your driver returned in response to a VIDIOC_QUERYBUF call. Please iterate through your list of buffers and be sure that the incoming address matches one of them; video drivers should not be a means by which hostile programs can map arbitrary regions of memory.
+
+The offset value you provide can be almost anything, incidentally. Some drivers just return (index<<PAGE_SHIFT), meaning that the incoming vm_pgoff field should just be the buffer index. The one thing you should not do is store the actual kernel-space address of the buffer in offset; leaking kernel addresses into user space is never a good idea.
+
+When user space maps a buffer, the driver should set the V4L2_BUF_FLAG_MAPPED flag in the associated v4l2_buffer structure. It must also set up open() and close() VMA operations so that it can track the number of processes which have the buffer mapped. As long as this buffer remains mapped somewhere, it cannot be released back to the kernel. If the mapping count of one or more buffers drops to zero, the driver should also stop any in-progress I/O, as there will be no process which can make use of it.
+
+Streaming I/O
+So far we have looked at a lot of setup without the transfer of a single frame. We're getting closer, but there is one more step which must happen first. When the application obtains buffers with VIDIOC_REQBUFS, those buffers are all in the user-space state; if they are user-space buffers, they do not really even exist yet. Before the application can start streaming I/O, it must put at least one buffer into the driver's incoming queue; for an output device, of course, those buffers should also be filled with valid frame data.
+
+To enqueue a buffer, the application will issue a VIDIOC_QBUF ioctl(), which the V4L2 maps into a call to the driver's vidioc_qbuf() method:
+
+    int (*vidioc_qbuf) (struct file *file, void *private_data,
+                        struct v4l2_buffer *buf);
+For memory-mapped buffers, once again, only the type and index fields of buf are valid. The driver can just perform the obvious checks (type and index make sense, the buffer is not already on one of the driver's queues, the buffer is mapped, etc.), put the buffer on its incoming queue (setting the V4L2_BUF_FLAG_QUEUED flag), and return.
+
+User-space buffers can be more complicated at this point, because the driver will have never seen this buffer before. When using this method, applications are allowed to pass a different address every time they enqueue a buffer, so the driver can do no setup ahead of time. If your driver is bouncing frames through a kernel-space buffer, it need only make a note of the user-space address provided by the application. If you are trying to DMA the data directly into user-space, however, life is significantly more challenging.
+
+To ship data directly into user space, the driver must first fault in all of the pages of the buffer and lock them into place; get_user_pages() is the tool to use for this job. Note that this function can perform significant amounts of memory allocation and disk I/O - it could block for a long time. You will need to take care to ensure that important driver functions do not stall while get_user_pages(), which can block for long enough for many video frames to go by, does its thing.
+
+Then there is the matter of telling the device to transfer image data to (or from) the user-space buffer. This buffer will not be contiguous in physical memory - it will, instead, be broken up into a large number of separate 4096-byte pages (on most architectures). Clearly, the device will have to be able to do scatter/gather DMA operations. If the device transfers full video frames at once, it will need to accept a scatterlist which holds a great many pages; a VGA-resolution image in a 16-bit format requires 150 pages. As the image size grows, so will the size of the scatterlist. The V4L2 specification says:
+
+If required by the hardware the driver swaps memory pages within physical memory to create a continuous area of memory. This happens transparently to the application in the virtual memory subsystem of the kernel.
+Your editor, however, is unwilling to recommend that driver writers attempt this kind of deep virtual memory trickery. A more promising approach could be to require user-space buffers to be located in hugetlb pages, but no drivers do that now.
+
+If your device transfers images in smaller pieces (a USB camera, for example), direct DMA to user space may be easier to set up. In any case, when faced with the challenges of supporting direct I/O to user-space buffers, the driver writer should (1) be sure that it is worth the trouble, given that applications tend to expect to use memory-mapped buffers anyway, and (2) make use of the video-buf layer, which can handle some of the pain for you.
+
+Once streaming I/O starts, the driver will grab buffers from its incoming queue, have the device perform the requested transfer, then move the buffer to the outgoing queue. The buffer flags should be adjusted accordingly when this transition happens; fields like the sequence number and time stamp should also be filled in at this time. Eventually the application will want to claim buffers in the outgoing queue, returning them to the user-space state. That is the job of VIDIOC_DQBUF, which becomes a call to:
+
+    int (*vidioc_dqbuf) (struct file *file, void *private_data,
+                         struct v4l2_buffer *buf);
+Here, the driver will remove the first buffer from the outgoing queue, storing the relevant information in *buf. Normally, if the outgoing queue is empty, this call should block until a buffer becomes available. V4L2 drivers are expected to handle non-blocking I/O, though, so if the video device has been opened with O_NONBLOCK, the driver should return -EAGAIN in the empty-queue case. Needless to say, this requirement also implies that the driver must support poll() for streaming I/O.
+
+The only remaining step is to actually tell the device to start performing streaming I/O. The Video4Linux2 driver methods for this task are:
+
+    int (*vidioc_streamon) (struct file *file, void *private_data,
+                            enum v4l2_buf_type type);
+    int (*vidioc_streamoff)(struct file *file, void *private_data,
+    	                    enum v4l2_buf_type type);
+The call to vidioc_streamon() should start the device after checking that type makes sense. The driver can, if need be, require that a certain number of buffers be in the incoming queue before streaming can be started.
+
+When the application is done it should generate a call to vidioc_streamoff(), which must stop the device. The driver should also remove all buffers from both the incoming and outgoing queues, leaving them all in the user-space state. Of course, the driver must be prepared for the application to simply close the device without stopping streaming first.
+
+Video4Linux2 part 7: Controls
+
+With the completion of part 6 of this series, we now know how to set up a video device and transfer frames back and forth. It is a well known fact, however, that users can be hard to please; not content with being able to see video from their camera device, they immediately start asking if they can play with parameters like brightness, contrast, and more. These adjustments could be done in the video application, and sometimes they are, but there are advantages to doing them in the hardware itself when the hardware has that capability. A brightness adjustment, for example, might lose dynamic range if done after the fact, but a hardware-based adjustment may retain the full range that the sensor is capable of delivering. Hardware-based adjustments, obviously, will also be easier on the host processor.
+Current hardware typically has a wide range of parameters which can be adjusted on the fly. Just how those parameters work varies widely from one device to the next, though. An adjustment as simple as "brightness" could involve a straightforward register setting, or it could require a rather more complex change to an obscure transformation matrix. It would be nice to hide as much of this detail from the application as possible, but there are limits to how much hiding can be done. An overly abstract interface might make it impossible to use the hardware's controls to their fullest potential.
+
+The V4L2 control interface tries to simplify things as much as possible while allowing full use of the hardware. It starts by defining a set of standard control names; these include V4L2_CID_BRIGHTNESS, V4L2_CID_CONTRAST, V4L2_CID_SATURATION, and many more. There are boolean controls for features like white balance, horizontal and vertical mirroring, etc. See the V4L2 API spec for a full list of predefined control ID values. There is also a provision for driver-specific controls, but those, clearly, will generally only be usable by special-purpose applications. Private controls start at V4L2_CID_PRIVATE_BASE and go up from there.
+
+In typical fashion, the V4L2 API provides a mechanism by which an application can enumerate the available controls. To that end, they will make ioctl() calls which end up in a V4L2 driver via the vidioc_queryctrl() callback:
+
+    int (*vidioc_queryctrl)(struct file *file, void *private_data,
+			    struct v4l2_queryctrl *qc);
+The driver will normally fill in the structure qc with information about the control of interest, or return EINVAL if that control is not supported. This structure has a number of fields:
+
+    struct v4l2_queryctrl
+    {
+	__u32		     id;
+	enum v4l2_ctrl_type  type;
+	__u8		     name[32];
+	__s32		     minimum;
+	__s32		     maximum;
+	__s32		     step;
+	__s32		     default_value;
+	__u32                flags;
+	__u32		     reserved[2];
+    };
+The control being queried will be passed in via id. As a special case, the application can supply a control ID with the V4L2_CTRL_FLAG_NEXT_CTRL bit set; when this happens, the driver should return information about the next supported control ID higher than the one given by the application. In any case, id should be set to the ID of the control actually being described.
+
+All of the other fields are set by the driver to describe the selected control. The data type of the control is given in type; it can be V4L2_CTRL_TYPE_INTEGER, V4L2_CTRL_TYPE_BOOLEAN, V4L2_CTRL_TYPE_MENU (for a set of fixed choices), or V4L2_CTRL_TYPE_BUTTON (for a control which performs some action when set and which ignores any given value). name describes the control; it could be used in the interface presented to the user by the application. For integer controls (only), minimum and maximum describe the range of values implemented by the control, and step gives the granularity of that range. default_value is exactly what it sounds like - though it is only applicable to integer, boolean, and menu controls. Drivers should set control values to their default at initialization time only; like other device parameters, they should persist across open() and close() calls. As a result, default_value may well not be the current value of the control.
+
+Inevitably, there is a set of flags which further describe a control. V4L2_CTRL_FLAG_DISABLED means that the control is disabled; the application should ignore it. V4L2_CTRL_FLAG_GRABBED means that the control, temporarily, cannot be changed, perhaps because another application has taken it over. V4L2_CTRL_FLAG_READ_ONLY marks controls which can be queried, but which cannot be changed. V4L2_CTRL_FLAG_UPDATE means that adjusting this control may affect the values of other controls. V4L2_CTRL_FLAG_INACTIVE marks a control which is not relevant to the current device configuration. And V4L2_CTRL_FLAG_SLIDER is a hint that applications should represent the control with a slider-like interface.
+
+Applications might just query a few controls which have been specifically programmed in, or they may want to enumerate the entire set. In the latter case, they will start at V4L2_CID_BASE and step through V4L2_CID_LASTP1, perhaps using the V4L2_CTRL_FLAG_NEXT_CTRL flag in the process. For controls of the menu variety (type V4L2_CTRL_TYPE_MENU), applications will probably want to enumerate the possible values as well. The relevant callback is:
+
+    int (*vidioc_querymenu)(struct file *file, void *private_data,
+			    struct v4l2_querymenu *qm);
+The v4l2_querymenu structure looks like:
+
+    struct v4l2_querymenu
+    {
+	__u32		id;
+	__u32		index;
+	__u8		name[32];
+	__u32		reserved;
+    };
+On input, id is the ID value for the menu control of interest, and index is the index value for a specific menu value. Index values start at zero and go up to the maximum value returned from vidioc_queryctrl(). The driver will fill in the name of the menu item; the reserved field should be set to zero.
+
+Once the application knows about the available controls, it will likely set about querying and changing their values. The structure used in this case is relatively simple:
+
+    struct v4l2_control
+    {
+	__u32 id;
+	__s32 value;
+    };
+To query a specific control, an application will set id to the ID of the control and make a call which ends up in the driver as:
+
+    int (*vidioc_g_ctrl)(struct file *file, void *private_data,
+    			 struct v4l2_control *ctrl);
+The driver should set value to the current setting of the control. Of course, it should also be sure that it knows about this specific control and return EINVAL if the application attempts to query a nonexistent control. Attempts to query button controls should also return EINVAL.
+
+A request to change a control ends up in:
+
+    int (*vidioc_s_ctrl)(struct file *file, void *private_data,
+			 struct v4l2_control *ctrl);
+The driver should verify the id and make sure that value falls within the allowed range. If all is well, the new value should be set in the hardware.
+
+Finally, it is worth noting that there is a separate extended controls interface supported with V4L2. This API is meant for relatively complex controls; in practice, its main use is for MPEG encoding and decoding parameters. Extended controls can be grouped into classes, and 64-bit integer values are supported. The interface is similar to the regular control interface; see the API specification for details.
